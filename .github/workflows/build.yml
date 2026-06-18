@@ -87,7 +87,7 @@ jobs:
             --with-openssl=no \
             --with-libcthreads=no \
             CFLAGS="-O2" \
-            LDFLAGS="-static-libgcc"
+            LDFLAGS="-static -static-libgcc"
 
       - name: Build
         run: make -j$(nproc)
