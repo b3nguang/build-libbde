@@ -85,8 +85,9 @@ jobs:
             --disable-winapi \
             --enable-wide-character-type \
             --with-openssl=no \
+            --with-libcthreads=no \
             CFLAGS="-O2" \
-            LDFLAGS="-static -static-libgcc"
+            LDFLAGS="-static-libgcc"
 
       - name: Build
         run: make -j$(nproc)
