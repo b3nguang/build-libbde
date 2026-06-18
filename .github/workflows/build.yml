@@ -86,7 +86,7 @@ jobs:
             --enable-wide-character-type \
             --with-openssl=no \
             CFLAGS="-O2" \
-            LDFLAGS="-static-libgcc -Wl,-Bstatic -lpthread -Wl,-Bdynamic"
+            LDFLAGS="-static -static-libgcc"
 
       - name: Build
         run: make -j$(nproc)
@@ -103,16 +103,18 @@ jobs:
           OBJDUMP=${{ matrix.host }}-objdump
           echo "== runtime DLL imports (expect only system DLLs) =="
           $OBJDUMP -p dist/libbde.dll | grep "DLL Name" || true
-          if $OBJDUMP -p dist/libbde.dll | grep -qi "libwinpthread"; then
-            echo "::warning::libbde.dll imports libwinpthread-1.dll (not self-contained)"
+          if $OBJDUMP -p dist/libbde.dll | grep -qi "libwinpthread\|libgcc\|libstdc"; then
+            echo "libbde.dll imports a mingw runtime DLL — not self-contained"
+            exit 1
           fi
           echo "== required exports =="
           EXPORTS=$($OBJDUMP -p dist/libbde.dll)
+          # Note: under HAVE_LOCAL_LIBBFIO libbfio errors are libcerror_error_t,
+          # freed via libbde_error_free — there is no libbfio_error_free symbol.
           for sym in \
             libbde_volume_open_file_io_handle \
             libbfio_handle_initialize \
-            libbfio_handle_free \
-            libbfio_error_free; do
+            libbfio_handle_free; do
             if echo "$EXPORTS" | grep -q "\b$sym\b"; then
               echo "  ok: $sym"
             else
@@ -121,7 +123,7 @@ jobs:
             fi
           done
           if [ -n "$MISSING" ]; then
-            echo "Required bfio exports missing — features.h.in guard or libbfio patch failed"
+            echo "Required bfio exports missing — libbfio dllexport patch failed"
             exit 1
           fi
 
