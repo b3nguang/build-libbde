@@ -1,0 +1,133 @@
+# Cross-compile libbde.dll for Windows (x86_64) via Ubuntu + mingw-w64.
+#
+# Unlike the upstream libyal workflows this build is tailored for LovelyCarve:
+# it patches the bundled libbfio so the resulting libbde.dll ALSO exports
+# libbfio's public constructors (libbfio_handle_initialize/free, ...) plus
+# libbde_volume_open_file_io_handle, letting the host open a BitLocker volume
+# from an in-memory IO handle instead of dumping it to a temp file first.
+#
+# Modelled on https://github.com/b3nguang/refsprogs/blob/main/.github/workflows/build.yml
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  build_windows:
+    name: windows-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            host: x86_64-w64-mingw32
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install \
+            autoconf \
+            automake \
+            autopoint \
+            libtool \
+            pkg-config \
+            build-essential \
+            git \
+            mingw-w64 \
+            mingw-w64-tools
+
+      - name: Sync libyal dependencies (vendors libbfio, libcaes, ...)
+        run: ./synclibs.sh --use-head
+
+      - name: Export libbfio public API from the combined DLL
+        # Under HAVE_LOCAL_LIBBFIO the synced libbfio_extern.h forces
+        # LIBBFIO_EXTERN to empty and never consults LIBBFIO_DLL_EXPORT, so the
+        # libbfio constructors would NOT land in libbde.dll's export table.
+        # Rewrite the local branch to emit __declspec(dllexport) directly.
+        run: |
+          python3 - <<'PY'
+          import re, pathlib, sys
+          p = pathlib.Path("libbfio/libbfio_extern.h")
+          src = p.read_text()
+          new = re.sub(
+              r'#define\s+LIBBFIO_EXTERN\s+/\* extern \*/',
+              '#define LIBBFIO_EXTERN\t\t__declspec(dllexport)',
+              src,
+          )
+          if new == src:
+              sys.exit("FAILED to patch libbfio_extern.h local LIBBFIO_EXTERN branch")
+          p.write_text(new)
+          print("patched libbfio/libbfio_extern.h -> dllexport")
+          PY
+
+      - name: Generate build system
+        run: ./autogen.sh
+
+      - name: Configure (cross-compile for ${{ matrix.host }}, libbde DLL only)
+        run: |
+          ./configure \
+            --host=${{ matrix.host }} \
+            --enable-shared \
+            --disable-static \
+            --without-libfuse \
+            --disable-python \
+            --disable-nls \
+            --disable-winapi \
+            --enable-wide-character-type \
+            --with-openssl=no \
+            CFLAGS="-O2" \
+            LDFLAGS="-static-libgcc -Wl,-Bstatic -lpthread -Wl,-Bdynamic"
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Collect, rename, strip
+        run: |
+          mkdir -p dist
+          cp libbde/.libs/libbde-1.dll dist/libbde.dll
+          ${{ matrix.host }}-strip --strip-unneeded dist/libbde.dll
+          ls -la dist/
+
+      - name: Audit exports + runtime imports (fail-fast)
+        run: |
+          OBJDUMP=${{ matrix.host }}-objdump
+          echo "== runtime DLL imports (expect only system DLLs) =="
+          $OBJDUMP -p dist/libbde.dll | grep "DLL Name" || true
+          if $OBJDUMP -p dist/libbde.dll | grep -qi "libwinpthread"; then
+            echo "::warning::libbde.dll imports libwinpthread-1.dll (not self-contained)"
+          fi
+          echo "== required exports =="
+          EXPORTS=$($OBJDUMP -p dist/libbde.dll)
+          for sym in \
+            libbde_volume_open_file_io_handle \
+            libbfio_handle_initialize \
+            libbfio_handle_free \
+            libbfio_error_free; do
+            if echo "$EXPORTS" | grep -q "\b$sym\b"; then
+              echo "  ok: $sym"
+            else
+              echo "  MISSING: $sym"
+              MISSING=1
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "Required bfio exports missing — features.h.in guard or libbfio patch failed"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbde-windows-${{ matrix.arch }}
+          path: dist/libbde.dll
+          if-no-files-found: error
