@@ -1,0 +1,146 @@
+# Build libbde.dll for Windows (x64) with MSVC via libyal vstools.
+#
+# Tailored for LovelyCarve: patches the bundled libbfio so the resulting
+# libbde.dll ALSO exports libbfio's public constructors
+# (libbfio_handle_initialize/free, ...) alongside
+# libbde_volume_open_file_io_handle, letting the host open a BitLocker volume
+# from an in-memory IO handle instead of dumping it to a temp file first.
+#
+# Modelled on https://github.com/b3nguang/build-libewf/.github/workflows.
+# Only the `libbde` project is built (not bdeinfo/bdemount), so the dokan/FUSE
+# mount tooling is never needed. MSVC links the system CRT, so the DLL is
+# self-contained (no mingw runtime DLLs) and already named `libbde.dll`.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master, 'ci/**', 'feat/**', 'fix/**']
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_msbuild:
+    name: windows-x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Clone libyal vstools
+        shell: pwsh
+        run: git clone https://github.com/libyal/vstools.git ..\vstools
+
+      - name: Sync dependency libraries (vendors libbfio, libcaes, ...)
+        shell: pwsh
+        run: .\synclibs.ps1 -UseHead
+
+      - name: Export libbfio public API from the combined DLL
+        # Under HAVE_LOCAL_LIBBFIO the synced libbfio_extern.h forces
+        # LIBBFIO_EXTERN to empty and never consults LIBBFIO_DLL_EXPORT, so the
+        # libbfio constructors would NOT land in libbde.dll's export table.
+        # Rewrite the local branch to emit __declspec(dllexport) directly.
+        shell: pwsh
+        run: |
+          $hdr = "libbfio\libbfio_extern.h"
+          $src = Get-Content -Raw $hdr
+          $new = $src -replace '#define\s+LIBBFIO_EXTERN\s+/\* extern \*/', '#define LIBBFIO_EXTERN __declspec(dllexport)'
+          if ($new -eq $src) {
+            Write-Error "FAILED to patch libbfio_extern.h local LIBBFIO_EXTERN branch"
+            exit 1
+          }
+          Set-Content -Path $hdr -Value $new
+          Write-Host "patched $hdr -> dllexport"
+
+      - name: Generate build files
+        shell: pwsh
+        run: .\autogen.ps1
+
+      - name: Convert msvscpp solution to vs2022
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          $env:PYTHONPATH = "..\vstools"
+          # vstools repo nests the script under vstools\vstools\scripts\.
+          & $python ..\vstools\vstools\scripts\msvscpp_convert.py `
+            --output-format 2022 --extend-with-x64 --no-python-dll msvscpp\libbde.sln
+          if (-not (Test-Path "vs2022\libbde.sln")) {
+            Write-Error "vstools did not produce vs2022\libbde.sln"
+            exit 1
+          }
+
+      - name: Build libbde DLL (x64, Release)
+        shell: pwsh
+        run: |
+          $msbuild = (Get-Command MSBuild.exe).Source
+          # Build only the libbde project; its solution dependencies pull in the
+          # static dep libs (libbfio, libcaes, ...) but NOT bdeinfo/bdemount,
+          # so the dokan/FUSE mount tooling is never required.
+          & $msbuild vs2022\libbde.sln `
+            /target:libbde `
+            /property:Configuration=Release,Platform=x64,PlatformToolset=v143 `
+            /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { Write-Error "MSBuild failed"; exit 1 }
+
+      - name: Locate, audit, stage libbde.dll
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path vs2022 -Recurse -Filter libbde.dll -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match 'x64' -or $_.FullName -match 'Release' } |
+                   Select-Object -First 1
+          if (-not $dll) {
+            $dll = Get-ChildItem -Path vs2022 -Recurse -Filter libbde.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $dll) { Write-Error "libbde.dll not found under vs2022"; exit 1 }
+          Write-Host "Built: $($dll.FullName)"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $dll.FullName -Destination dist\libbde.dll -Force
+
+          # Audit exports with dumpbin (ships with the VS toolchain).
+          $dumpbin = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+          if ($dumpbin) {
+            $exports = & $dumpbin /exports dist\libbde.dll | Out-String
+            Write-Host "=== required exports ==="
+            $missing = $false
+            foreach ($sym in @(
+              'libbde_volume_open_file_io_handle',
+              'libbfio_handle_initialize',
+              'libbfio_handle_free')) {
+              if ($exports -match [regex]::Escape($sym)) {
+                Write-Host "  ok: $sym"
+              } else {
+                Write-Host "  MISSING: $sym"
+                $missing = $true
+              }
+            }
+            if ($missing) {
+              Write-Error "Required bfio exports missing - libbfio dllexport patch failed"
+              exit 1
+            }
+          } else {
+            Write-Warning "dumpbin not found; skipping export audit"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libbde-windows-x64
+          path: dist/libbde.dll
+          if-no-files-found: error
